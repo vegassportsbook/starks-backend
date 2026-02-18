@@ -3,64 +3,88 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 import datetime
 
-app = FastAPI()
+app = FastAPI(title="Starks Sportsbook Backend")
 
-# 🔥 Enable CORS for Vercel frontend
+# --------------------------------------------------
+# CORS (Allow Vercel + Browser Access)
+# --------------------------------------------------
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # tighten later if needed
+    allow_origins=["*"],  # You can restrict later to your Vercel domain
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-current_sport = "MLB"
+# --------------------------------------------------
+# Root Health Check
+# --------------------------------------------------
 
 @app.get("/")
 def root():
     return {
         "ok": True,
         "message": "Starks Sportsbook Backend Online",
-        "timestamp": str(datetime.datetime.utcnow())
+        "timestamp": datetime.datetime.utcnow().isoformat()
     }
 
-@app.post("/api/set_sport")
-def set_sport(data: dict):
-    global current_sport
-    current_sport = data.get("sport", "MLB")
-    return {"ok": True, "sport": current_sport}
+# --------------------------------------------------
+# Status Endpoint
+# --------------------------------------------------
 
-@app.post("/api/mock_slate")
-def mock_slate(data: dict):
-    rows = data.get("rows", 100)
-    return {
-        "ok": True,
-        "message": f"Mock slate generated",
-        "rows": rows,
-        "sport": current_sport
-    }
-
-@app.get("/api/status")
+@app.get("/status")
 def status():
     return {
-        "ok": True,
-        "sport": current_sport,
-        "engine": "FastAPI Live"
+        "backend": "running",
+        "engine": "online",
+        "timestamp": datetime.datetime.utcnow().isoformat()
     }
 
-@app.post("/api/optimize")
-def optimize(data: dict):
+# --------------------------------------------------
+# Mock Slate Endpoint
+# --------------------------------------------------
+
+@app.post("/mock_slate")
+def mock_slate(rows: int = 100):
     return {
         "ok": True,
-        "profile": data.get("profile"),
-        "lineups_requested": data.get("lineups"),
-        "result": "Optimization complete (mock)"
+        "rows_generated": rows,
+        "note": "Mock slate created"
     }
 
-@app.post("/api/upload")
+# --------------------------------------------------
+# Set Sport Endpoint
+# --------------------------------------------------
+
+@app.post("/set_sport")
+def set_sport(payload: dict):
+    return {
+        "ok": True,
+        "sport_selected": payload.get("sport", "Unknown")
+    }
+
+# --------------------------------------------------
+# Optimize Endpoint
+# --------------------------------------------------
+
+@app.post("/optimize")
+def optimize(payload: dict):
+    return {
+        "ok": True,
+        "profile": payload.get("profile"),
+        "lineups_requested": payload.get("lineups"),
+        "result": "Optimization simulated"
+    }
+
+# --------------------------------------------------
+# CSV Upload Endpoint
+# --------------------------------------------------
+
+@app.post("/upload")
 async def upload(file: UploadFile = File(...)):
     return {
         "ok": True,
         "filename": file.filename,
-        "message": "File received"
+        "note": "File received successfully"
     }
