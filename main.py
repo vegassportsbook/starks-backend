@@ -1,4 +1,9 @@
 from fastapi import FastAPI
+from database import engine, Base
+import models
+
+Base.metadata.create_all(bind=engine)
+
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
