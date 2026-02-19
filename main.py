@@ -1,108 +1,58 @@
-from fastapi import FastAPI
-from database import engine, Base
-import models
-
-Base.metadata.create_all(bind=engine)
-
+from fastapi import FastAPI, Depends, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, Field
-from typing import List, Optional, Literal, Dict, Any
+from sqlalchemy.orm import Session
+from typing import Optional, List
 import datetime
 import random
-import sqlite3
-import os
-import json
+
+from database import engine, Base, get_db
+import models
+from schemas import TicketCreate, TicketSettle
+
+# Create tables (Phase 1 simple approach)
+Base.metadata.create_all(bind=engine)
 
 app = FastAPI()
 
-# -----------------------------
-# CORS (CRITICAL FOR VERCEL)
-# -----------------------------
+# CORS (lock to your Vercel domains later)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # lock to Vercel later
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
 # -----------------------------
-# DB (SQLite)
-# -----------------------------
-DB_PATH = os.getenv("STARKS_DB_PATH", "starks.db")
-
-def db():
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    return conn
-
-def init_db():
-    conn = db()
-    cur = conn.cursor()
-
-    cur.execute("""
-    CREATE TABLE IF NOT EXISTS tickets (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        created_at TEXT NOT NULL,
-        mode TEXT NOT NULL,                   -- single | parlay
-        stake REAL NOT NULL,                  -- stake per ticket (parlay) or per-leg (single)
-        bankroll REAL NOT NULL,
-        cost REAL NOT NULL,
-        decimal_odds REAL,
-        implied_prob REAL,
-        model_prob REAL,
-        ev_profit REAL,
-        status TEXT NOT NULL,                 -- pending | settled
-        result TEXT,                          -- win | loss
-        profit REAL,                          -- +profit or -cost
-        meta_json TEXT
-    );
-    """)
-
-    cur.execute("""
-    CREATE TABLE IF NOT EXISTS legs (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        ticket_id INTEGER NOT NULL,
-        sport TEXT,
-        start TEXT,
-        matchup TEXT,
-        market TEXT,
-        line TEXT,
-        odds REAL,
-        book TEXT,
-        edge REAL,
-        signal_score REAL,
-        signal_label TEXT,
-        steam_detected INTEGER,
-        implied_prob REAL,
-        model_prob REAL,
-        decimal_odds REAL,
-        FOREIGN KEY(ticket_id) REFERENCES tickets(id) ON DELETE CASCADE
-    );
-    """)
-
-    conn.commit()
-    conn.close()
-
-init_db()
-
-# -----------------------------
 # Odds math helpers
 # -----------------------------
-def american_to_decimal(a: Optional[float]) -> Optional[float]:
+def american_to_decimal(a: Optional[int]) -> Optional[float]:
     if a is None or a == 0:
         return None
     if a > 0:
         return 1 + (a / 100.0)
     return 1 + (100.0 / abs(a))
 
-def american_to_implied_prob(a: Optional[float]) -> Optional[float]:
+def american_to_implied_prob(a: Optional[int]) -> Optional[float]:
     if a is None or a == 0:
         return None
     if a > 0:
         return 100.0 / (a + 100.0)
     return abs(a) / (abs(a) + 100.0)
+
+def clamp01(x: float) -> float:
+    return max(0.0, min(1.0, x))
+
+# Edge tiers based on projected_edge (0.06=6%)
+def classify_tier(edge: Optional[float]) -> str:
+    if edge is None:
+        return "C"
+    if edge >= 0.06:
+        return "A"
+    if edge >= 0.03:
+        return "B"
+    return "C"
 
 # -----------------------------
 # ROOT HEALTH CHECK
@@ -111,32 +61,28 @@ def american_to_implied_prob(a: Optional[float]) -> Optional[float]:
 def root():
     return {
         "ok": True,
-        "message": "Starks Sportsbook Backend Online",
+        "message": "Starks Edge Lab Backend Online",
         "timestamp": str(datetime.datetime.utcnow())
     }
 
-# -----------------------------
-# API HEALTH
-# -----------------------------
 @app.get("/api/health")
 def health():
     return {
         "ok": True,
-        "service": "starks-backend",
+        "service": "starks-edge-lab",
         "timestamp": str(datetime.datetime.utcnow())
     }
 
 # -----------------------------
-# LIVE BOARD (DEMO + SIGNAL ENGINE)
+# Demo board (kept from your old build)
 # -----------------------------
 @app.get("/api/board")
 def board():
-
     def move_line(base):
         return base + random.choice([-1, 0, 1])
 
-    def compute_signal(edge: float, odds_delta: float):
-        ev_score = min((edge or 0) / 5.0, 1)
+    def compute_signal(edge_pct: float, odds_delta: float):
+        ev_score = min((edge_pct or 0) / 0.05, 1)  # normalize: 5% edge -> 1
         steam_flag = abs(odds_delta) >= 1
         steam_score = 1 if steam_flag else 0
         drift_score = min(abs(odds_delta) / 2.0, 1)
@@ -161,44 +107,16 @@ def board():
         return signal_score, label, steam_flag
 
     raw_rows = [
-        {
-            "sport": "NCAAB",
-            "start": "02/18, 10:18 PM",
-            "matchup": "KANSAS @ BAYLOR",
-            "market": "ML",
-            "line": "KANSAS",
-            "base_odds": -135,
-            "book": "DraftKings",
-            "edge": round(random.uniform(1.5, 3.5), 2)
-        },
-        {
-            "sport": "NBA",
-            "start": "02/18, 8:57 PM",
-            "matchup": "BOS @ MIA",
-            "market": "SPREAD",
-            "line": "BOS -2.5",
-            "base_odds": -110,
-            "book": "Circa",
-            "edge": round(random.uniform(1.0, 3.0), 2)
-        },
-        {
-            "sport": "NFL",
-            "start": "02/18, 10:37 PM",
-            "matchup": "KC @ CIN",
-            "market": "TOTAL",
-            "line": "O 47.5",
-            "base_odds": -108,
-            "book": "FanDuel",
-            "edge": round(random.uniform(0.5, 2.5), 2)
-        }
+        {"sport":"NCAAB","start":"02/18, 10:18 PM","matchup":"KANSAS @ BAYLOR","market":"ML","line":"KANSAS","base_odds":-135,"book":"DraftKings","edge_pct":0.032},
+        {"sport":"NBA","start":"02/18, 8:57 PM","matchup":"BOS @ MIA","market":"SPREAD","line":"BOS -2.5","base_odds":-110,"book":"Circa","edge_pct":0.021},
+        {"sport":"NFL","start":"02/18, 10:37 PM","matchup":"KC @ CIN","market":"TOTAL","line":"O 47.5","base_odds":-108,"book":"FanDuel","edge_pct":0.014},
     ]
 
     rows = []
     for r in raw_rows:
         moved_odds = move_line(r["base_odds"])
         odds_delta = moved_odds - r["base_odds"]
-        signal_score, signal_label, steam_flag = compute_signal(r["edge"], odds_delta)
-
+        signal_score, signal_label, steam_flag = compute_signal(r["edge_pct"], odds_delta)
         rows.append({
             "sport": r["sport"],
             "start": r["start"],
@@ -207,278 +125,321 @@ def board():
             "line": r["line"],
             "odds": moved_odds,
             "book": r["book"],
-            "edge": r["edge"],
+            "edge_pct": r["edge_pct"],
             "signal_score": signal_score,
             "signal_label": signal_label,
             "steam_detected": steam_flag
         })
 
-    return JSONResponse({
-        "ok": True,
-        "rows": rows,
-        "timestamp": str(datetime.datetime.utcnow())
-    })
+    return JSONResponse({"ok": True, "rows": rows, "timestamp": str(datetime.datetime.utcnow())})
 
 # -----------------------------
-# TICKET LOGGING MODELS
-# -----------------------------
-class LegIn(BaseModel):
-    sport: Optional[str] = None
-    start: Optional[str] = None
-    matchup: Optional[str] = None
-    market: Optional[str] = None
-    line: Optional[str] = None
-    odds: Optional[float] = None
-    book: Optional[str] = None
-    edge: Optional[float] = None
-    signal_score: Optional[float] = None
-    signal_label: Optional[str] = None
-    steam_detected: Optional[bool] = None
-
-class TicketCreate(BaseModel):
-    mode: Literal["single", "parlay"] = "parlay"
-    stake: float = 25.0
-    bankroll: float = 10000.0
-    legs: List[LegIn] = Field(default_factory=list)
-    meta: Dict[str, Any] = Field(default_factory=dict)
-
-class TicketSettle(BaseModel):
-    result: Literal["win", "loss"]
-
-# -----------------------------
-# Create tickets
-# - single mode: creates one ticket per leg (clean analytics)
-# - parlay mode: creates one ticket for the slip
+# Create tickets (Postgres)
+# - single: one ticket per leg
+# - parlay: one ticket with multiple legs
 # -----------------------------
 @app.post("/api/tickets")
-def create_ticket(payload: TicketCreate):
-    created_at = str(datetime.datetime.utcnow())
-    stake = float(payload.stake)
-    bankroll = float(payload.bankroll)
-    legs = payload.legs or []
+def create_ticket(payload: TicketCreate, db: Session = Depends(get_db)):
+    if not payload.legs:
+        raise HTTPException(status_code=400, detail="No legs provided")
 
-    if not legs:
-        return JSONResponse({"ok": False, "error": "No legs provided"}, status_code=400)
+    created_ids: List[int] = []
 
-    conn = db()
-    cur = conn.cursor()
-
-    created_ids = []
-
-    def insert_ticket(mode: str, ticket_legs: List[LegIn]) -> int:
-        # compute combined decimals/probs
-        decimals = []
-        implieds = []
-        models = []
-
-        for lg in ticket_legs:
+    def insert_ticket(bet_type: str, legs):
+        # Combine probabilities/decimals for parlay, or use single leg for single
+        if bet_type == "single":
+            lg = legs[0]
             dec = american_to_decimal(lg.odds)
             imp = american_to_implied_prob(lg.odds)
-            # model prob approx: implied + edge
-            model = None
-            if imp is not None and lg.edge is not None:
-                model = max(0.0, min(1.0, imp + (float(lg.edge) / 100.0)))
+            model_p = None
+            if imp is not None and lg.edge_pct is not None:
+                model_p = clamp01(imp + float(lg.edge_pct))
+            edge = float(lg.edge_pct) if lg.edge_pct is not None else None
+            tier = classify_tier(edge)
+
+            cost = float(payload.stake)
+            ev_profit = None
+            if dec is not None and model_p is not None:
+                ev_profit = cost * (dec * model_p - 1.0)
+
+            t = models.Ticket(
+                bet_type="single",
+                market_type=lg.market_type,
+                confidence_tier=tier,
+                stake=payload.stake,
+                cost=cost,
+                american_odds=lg.odds,
+                decimal_odds=dec,
+                implied_prob=imp,
+                model_prob=model_p,
+                projected_edge=edge,
+                ev_profit=ev_profit,
+                status="pending",
+                sport=payload.sport or lg.sport,
+                event=payload.event or lg.matchup,
+                selection=payload.selection or lg.line,
+                book=payload.book or lg.book,
+            )
+            db.add(t)
+            db.flush()  # get t.id
+
+            leg_row = models.Leg(
+                ticket_id=t.id,
+                sport=lg.sport,
+                start=lg.start,
+                matchup=lg.matchup,
+                market_type=lg.market_type,
+                market=lg.market,
+                line=lg.line,
+                odds=lg.odds,
+                book=lg.book,
+                edge_pct=lg.edge_pct,
+                signal_score=lg.signal_score,
+                signal_label=lg.signal_label,
+                steam_detected=bool(lg.steam_detected),
+                implied_prob=imp,
+                model_prob=model_p,
+                decimal_odds=dec,
+            )
+            db.add(leg_row)
+            return t.id
+
+        # parlay
+        decimals = []
+        implieds = []
+        models_p = []
+        edges = []
+
+        for lg in legs:
+            dec = american_to_decimal(lg.odds)
+            imp = american_to_implied_prob(lg.odds)
+            model_p = None
+            if imp is not None and lg.edge_pct is not None:
+                model_p = clamp01(imp + float(lg.edge_pct))
 
             if dec is not None: decimals.append(dec)
             if imp is not None: implieds.append(imp)
-            if model is not None: models.append(model)
+            if model_p is not None: models_p.append(model_p)
+            if lg.edge_pct is not None: edges.append(float(lg.edge_pct))
 
-        if mode == "parlay":
-            dec_total = 1.0
-            imp_total = 1.0
-            model_total = 1.0
-            any_dec = False
-            any_imp = False
-            any_model = False
+        dec_total = None
+        imp_total = None
+        model_total = None
 
-            for d in decimals:
-                dec_total *= d
-                any_dec = True
-            for p in implieds:
-                imp_total *= p
-                any_imp = True
-            for mp in models:
-                model_total *= mp
-                any_model = True
+        if decimals:
+            d = 1.0
+            for x in decimals: d *= x
+            dec_total = d
 
-            decimal_odds = dec_total if any_dec else None
-            implied_prob = imp_total if any_imp else None
-            model_prob = model_total if any_model else None
+        if implieds:
+            p = 1.0
+            for x in implieds: p *= x
+            imp_total = p
 
-            cost = stake
-            ev_profit = None
-            if decimal_odds is not None and model_prob is not None:
-                ev_profit = cost * (decimal_odds * model_prob - 1.0)
+        if models_p:
+            mp = 1.0
+            for x in models_p: mp *= x
+            model_total = mp
 
-        else:
-            # single ticket: one leg only
-            lg = ticket_legs[0]
-            decimal_odds = american_to_decimal(lg.odds)
-            implied_prob = american_to_implied_prob(lg.odds)
-            model_prob = None
-            if implied_prob is not None and lg.edge is not None:
-                model_prob = max(0.0, min(1.0, implied_prob + (float(lg.edge) / 100.0)))
-            cost = stake
-            ev_profit = None
-            if decimal_odds is not None and model_prob is not None:
-                ev_profit = cost * (decimal_odds * model_prob - 1.0)
+        # Ticket-level projected edge (simple aggregate: mean of leg edges)
+        edge = (sum(edges) / len(edges)) if edges else None
+        tier = classify_tier(edge)
 
-        cur.execute("""
-            INSERT INTO tickets
-            (created_at, mode, stake, bankroll, cost, decimal_odds, implied_prob, model_prob, ev_profit, status, result, profit, meta_json)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', NULL, NULL, ?)
-        """, (
-            created_at, mode, stake, bankroll, float(cost),
-            decimal_odds, implied_prob, model_prob, ev_profit,
-            json.dumps(payload.meta or {})
-        ))
+        cost = float(payload.stake)
+        ev_profit = None
+        if dec_total is not None and model_total is not None:
+            ev_profit = cost * (dec_total * model_total - 1.0)
 
-        ticket_id = cur.lastrowid
+        t = models.Ticket(
+            bet_type="parlay",
+            market_type=None,
+            confidence_tier=tier,
+            stake=payload.stake,
+            cost=cost,
+            american_odds=None,
+            decimal_odds=dec_total,
+            implied_prob=imp_total,
+            model_prob=model_total,
+            projected_edge=edge,
+            ev_profit=ev_profit,
+            status="pending",
+            sport=payload.sport,
+            event=payload.event,
+            selection=payload.selection,
+            book=payload.book,
+        )
+        db.add(t)
+        db.flush()
 
-        for lg in ticket_legs:
+        for lg in legs:
             dec = american_to_decimal(lg.odds)
             imp = american_to_implied_prob(lg.odds)
-            model = None
-            if imp is not None and lg.edge is not None:
-                model = max(0.0, min(1.0, imp + (float(lg.edge) / 100.0)))
+            model_p = None
+            if imp is not None and lg.edge_pct is not None:
+                model_p = clamp01(imp + float(lg.edge_pct))
 
-            cur.execute("""
-                INSERT INTO legs
-                (ticket_id, sport, start, matchup, market, line, odds, book, edge, signal_score, signal_label, steam_detected, implied_prob, model_prob, decimal_odds)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """, (
-                ticket_id,
-                lg.sport, lg.start, lg.matchup, lg.market, lg.line,
-                lg.odds, lg.book, lg.edge,
-                lg.signal_score, lg.signal_label,
-                1 if lg.steam_detected else 0,
-                imp, model, dec
+            db.add(models.Leg(
+                ticket_id=t.id,
+                sport=lg.sport,
+                start=lg.start,
+                matchup=lg.matchup,
+                market_type=lg.market_type,
+                market=lg.market,
+                line=lg.line,
+                odds=lg.odds,
+                book=lg.book,
+                edge_pct=lg.edge_pct,
+                signal_score=lg.signal_score,
+                signal_label=lg.signal_label,
+                steam_detected=bool(lg.steam_detected),
+                implied_prob=imp,
+                model_prob=model_p,
+                decimal_odds=dec,
             ))
 
-        return ticket_id
+        return t.id
 
-    if payload.mode == "single":
-        for lg in legs:
+    if payload.bet_type == "single":
+        for lg in payload.legs:
             created_ids.append(insert_ticket("single", [lg]))
     else:
-        created_ids.append(insert_ticket("parlay", legs))
+        created_ids.append(insert_ticket("parlay", payload.legs))
 
-    conn.commit()
-    conn.close()
-
+    db.commit()
     return {"ok": True, "created_ticket_ids": created_ids}
 
 # -----------------------------
-# Ticket history
+# Ticket list
 # -----------------------------
 @app.get("/api/tickets")
-def list_tickets(limit: int = 50):
-    conn = db()
-    cur = conn.cursor()
-    cur.execute("""
-        SELECT * FROM tickets ORDER BY id DESC LIMIT ?
-    """, (limit,))
-    tickets = [dict(r) for r in cur.fetchall()]
+def list_tickets(limit: int = 50, db: Session = Depends(get_db)):
+    tickets = db.query(models.Ticket).order_by(models.Ticket.id.desc()).limit(limit).all()
 
-    # attach legs
+    out = []
     for t in tickets:
-        cur.execute("SELECT * FROM legs WHERE ticket_id = ? ORDER BY id ASC", (t["id"],))
-        t["legs"] = [dict(x) for x in cur.fetchall()]
-        # coerce some fields
-        if t.get("meta_json"):
-            try:
-                t["meta"] = json.loads(t["meta_json"])
-            except:
-                t["meta"] = {}
-        else:
-            t["meta"] = {}
-        t.pop("meta_json", None)
+        out.append({
+            "id": t.id,
+            "created_at": str(t.created_at),
+            "status": t.status,
+            "result": t.result,
+            "bet_type": t.bet_type,
+            "market_type": t.market_type,
+            "confidence_tier": t.confidence_tier,
+            "stake": float(t.stake),
+            "cost": float(t.cost),
+            "profit": float(t.profit) if t.profit is not None else None,
+            "projected_edge": float(t.projected_edge) if t.projected_edge is not None else None,
+            "clv": float(t.clv) if t.clv is not None else None,
+            "legs": [{
+                "id": lg.id,
+                "sport": lg.sport,
+                "start": lg.start,
+                "matchup": lg.matchup,
+                "market_type": lg.market_type,
+                "market": lg.market,
+                "line": lg.line,
+                "odds": lg.odds,
+                "book": lg.book,
+                "edge_pct": float(lg.edge_pct) if lg.edge_pct is not None else None,
+                "signal_score": lg.signal_score,
+                "signal_label": lg.signal_label,
+                "steam_detected": lg.steam_detected,
+            } for lg in (t.legs or [])]
+        })
 
-    conn.close()
-    return {"ok": True, "tickets": tickets}
+    return {"ok": True, "tickets": out}
 
 # -----------------------------
-# Settle ticket (win/loss) and compute profit
+# Settle a ticket
 # profit convention:
 # - loss: -cost
 # - win: (stake * decimal_odds) - cost
+# - push: 0
 # -----------------------------
 @app.post("/api/tickets/{ticket_id}/settle")
-def settle_ticket(ticket_id: int, payload: TicketSettle):
-    conn = db()
-    cur = conn.cursor()
-
-    cur.execute("SELECT * FROM tickets WHERE id = ?", (ticket_id,))
-    t = cur.fetchone()
+def settle_ticket(ticket_id: int, payload: TicketSettle, db: Session = Depends(get_db)):
+    t = db.query(models.Ticket).filter(models.Ticket.id == ticket_id).first()
     if not t:
-        conn.close()
-        return JSONResponse({"ok": False, "error": "Ticket not found"}, status_code=404)
+        raise HTTPException(status_code=404, detail="Ticket not found")
 
-    if t["status"] == "settled":
-        conn.close()
+    if t.status == "settled":
         return {"ok": True, "ticket_id": ticket_id, "status": "settled"}
 
-    cost = float(t["cost"])
-    stake = float(t["stake"])
-    dec = t["decimal_odds"]
-    mode = t["mode"]
+    cost = float(t.cost)
+    stake = float(t.stake)
+    dec = float(t.decimal_odds) if t.decimal_odds is not None else None
 
-    if payload.result == "loss":
-        profit = -cost
+    if payload.profit_override is not None:
+        profit = float(payload.profit_override)
     else:
-        if dec is None:
-            # if decimal unknown, assume even money payout
-            profit = stake - cost
+        if payload.result == "loss":
+            profit = -cost
+        elif payload.result == "push":
+            profit = 0.0
         else:
-            payout = stake * float(dec)
-            profit = payout - cost
+            if dec is None:
+                profit = stake - cost
+            else:
+                payout = stake * dec
+                profit = payout - cost
 
-    cur.execute("""
-        UPDATE tickets
-        SET status='settled', result=?, profit=?
-        WHERE id=?
-    """, (payload.result, float(profit), ticket_id))
+    # CLV (simple placeholder): if closing_line provided and we have an american_odds (single)
+    clv = None
+    if payload.closing_line is not None and t.american_odds is not None:
+        clv = float(payload.closing_line - int(t.american_odds))
 
-    conn.commit()
-    conn.close()
+    t.status = "settled"
+    t.result = payload.result
+    t.profit = profit
+    t.closing_line = payload.closing_line
+    t.clv = clv
 
-    return {"ok": True, "ticket_id": ticket_id, "result": payload.result, "profit": profit}
+    db.commit()
+    return {"ok": True, "ticket_id": ticket_id, "result": payload.result, "profit": profit, "clv": clv}
 
 # -----------------------------
-# Performance summary
+# Performance summary (overall + splits)
 # -----------------------------
 @app.get("/api/performance")
-def performance():
-    conn = db()
-    cur = conn.cursor()
+def performance(db: Session = Depends(get_db)):
+    tickets_all = db.query(models.Ticket).all()
+    tickets_settled = db.query(models.Ticket).filter(models.Ticket.status == "settled").all()
 
-    cur.execute("SELECT COUNT(*) as n FROM tickets")
-    total = cur.fetchone()["n"]
+    total = len(tickets_all)
+    settled = len(tickets_settled)
 
-    cur.execute("SELECT COUNT(*) as n FROM tickets WHERE status='settled'")
-    settled = cur.fetchone()["n"]
+    wins = sum(1 for t in tickets_settled if t.result == "win")
+    losses = sum(1 for t in tickets_settled if t.result == "loss")
 
-    cur.execute("SELECT COUNT(*) as n FROM tickets WHERE status='settled' AND result='win'")
-    wins = cur.fetchone()["n"]
-
-    cur.execute("SELECT COUNT(*) as n FROM tickets WHERE status='settled' AND result='loss'")
-    losses = cur.fetchone()["n"]
-
-    cur.execute("SELECT COALESCE(SUM(profit), 0) as p FROM tickets WHERE status='settled'")
-    profit = float(cur.fetchone()["p"] or 0)
-
-    cur.execute("SELECT COALESCE(SUM(cost), 0) as c FROM tickets WHERE status='settled'")
-    cost = float(cur.fetchone()["c"] or 0)
+    profit = sum(float(t.profit) for t in tickets_settled if t.profit is not None)
+    cost = sum(float(t.cost) for t in tickets_settled if t.cost is not None)
 
     roi = (profit / cost) if cost > 0 else 0.0
     winrate = (wins / settled) if settled > 0 else 0.0
 
-    # last 30 days
-    cutoff = (datetime.datetime.utcnow() - datetime.timedelta(days=30)).isoformat()
-    cur.execute("SELECT COALESCE(SUM(profit),0) as p FROM tickets WHERE status='settled' AND created_at >= ?", (cutoff,))
-    profit_30 = float(cur.fetchone()["p"] or 0)
+    def split(filter_fn):
+        group = [t for t in tickets_settled if filter_fn(t)]
+        g_profit = sum(float(t.profit) for t in group if t.profit is not None)
+        g_cost = sum(float(t.cost) for t in group if t.cost is not None)
+        g_wins = sum(1 for t in group if t.result == "win")
+        g_settled = len(group)
+        return {
+            "settled": g_settled,
+            "wins": g_wins,
+            "winrate": (g_wins / g_settled) if g_settled else 0.0,
+            "profit": g_profit,
+            "cost": g_cost,
+            "roi": (g_profit / g_cost) if g_cost else 0.0,
+        }
 
-    conn.close()
+    by_tier = {
+        "A": split(lambda t: t.confidence_tier == "A"),
+        "B": split(lambda t: t.confidence_tier == "B"),
+        "C": split(lambda t: t.confidence_tier == "C"),
+    }
+
+    singles = split(lambda t: t.bet_type == "single")
+    parlays = split(lambda t: t.bet_type == "parlay")
 
     return {
         "ok": True,
@@ -490,6 +451,10 @@ def performance():
         "profit": profit,
         "cost": cost,
         "roi": roi,
-        "profit_30d": profit_30,
+        "splits": {
+            "by_tier": by_tier,
+            "singles": singles,
+            "parlays": parlays,
+        },
         "timestamp": str(datetime.datetime.utcnow())
     }
