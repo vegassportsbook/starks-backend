@@ -57,7 +57,7 @@ def classify_tier(edge: Optional[float]) -> str:
 # -----------------------------
 # ROOT HEALTH CHECK
 # -----------------------------
-@app.get("/")
+@app.api_route("/", methods=["GET", "HEAD"])
 def root():
     return {
         "ok": True,
