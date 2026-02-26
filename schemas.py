@@ -52,3 +52,38 @@ class TicketOut(BaseModel):
 
     class Config:
         from_attributes = True
+# ----- Phase 2 Eval API -----
+
+class EvalRow(BaseModel):
+    sport: Optional[str] = None
+    start: Optional[str] = None
+    matchup: Optional[str] = None
+
+    market_type: Optional[str] = None
+    market: Optional[str] = None
+    line: Optional[str] = None
+
+    odds: Optional[int] = None
+    odds_delta: Optional[float] = 0.0
+    book: Optional[str] = None
+
+    edge_pct: Optional[float] = None
+
+    signal_score: Optional[int] = 0
+    signal_label: Optional[str] = None
+    steam_detected: Optional[bool] = False
+
+
+class EvalRequest(BaseModel):
+    bankroll: float = 10000.0
+    unit_size: float = 25.0
+    kelly_fraction: float = 0.25
+    max_units: float = 6.0
+    sharp_watch_threshold: float = 70.0
+    rows: List[EvalRow]
+
+
+class EvalResponse(BaseModel):
+    ok: bool
+    rows: List[Dict[str, Any]]
+    timestamp: str
